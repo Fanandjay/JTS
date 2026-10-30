@@ -84,7 +84,7 @@ static void RS485_OnFrame(const uint8_t *data, uint16_t len)
 
   memcpy(g_frame, data, len);
   g_frame_len = len;
-  HAL_GPIO_TogglePin(LEDG_GPIO_Port, LEDG_Pin);
+  HAL_GPIO_TogglePin(LEDB_GPIO_Port, LEDB_Pin);
 }
 /* USER CODE END 0 */
 
