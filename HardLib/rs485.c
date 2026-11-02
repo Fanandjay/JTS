@@ -93,6 +93,19 @@ uint8_t RS485_IsBusy(void)
   return s_tx_busy;
 }
 
+/* 判帧前要检查 DMA 中尚未经 IDLE 回调交付的字节。
+   RXNE 也要检查：最后一个字节可能还没被 DMA 搬走。 */
+uint8_t RS485_IsRxActive(void)
+{
+  if ((s_tx_busy != 0U) || (huart2.RxState != HAL_UART_STATE_BUSY_RX))
+  {
+    return 0U;
+  }
+
+  return ((__HAL_DMA_GET_COUNTER(huart2.hdmarx) != RS485_RX_BUF_SIZE) ||
+          (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE) != RESET)) ? 1U : 0U;
+}
+
 /**
   * @brief 发送一个字符串
   */

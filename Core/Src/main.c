@@ -25,6 +25,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "rs485.h"
+#include "ds18b20.h"
+#include "modbus.h"
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -46,12 +48,9 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* 中断与主循环之间的交接区：中断只负责拷贝+置长度，主循环负责真正发送 */
-static uint8_t          g_frame[RS485_RX_BUF_SIZE];
-static volatile uint16_t g_frame_len = 0U;
-
-static uint32_t g_tick_last = 0U;   /* 主动上报节拍 */
-static uint32_t g_report_cnt = 0U;
+/* LED 规律闪烁的状态 */
+static uint32_t g_led_tick = 0U;
+static uint8_t  g_led_step = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,29 +61,104 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/**
-  * @brief 收帧回调（USART2 中断上下文）
-  * @note  这里千万不能直接调 RS485_Send：
-  *        1) 它内部会 HAL_UART_AbortReceive + 启动 DMA，全部是带 __HAL_LOCK 的
-  *           阻塞式操作，在中断里跑有死锁风险；
-  *        2) 发送要等前一帧结束，中断里没地方等待。
-  *        正确做法是只把数据搬到交接区，交给主循环发。
-  */
-static void RS485_OnFrame(const uint8_t *data, uint16_t len)
+/* 板上 LED 的有效电平：高电平点亮填 1，低电平点亮填 0。
+   接反了不影响通信，只是读写线圈的效果整体反相。 */
+#define LED_ACTIVE_HIGH   1U
+
+static void app_led_write(GPIO_TypeDef *port, uint16_t pin, uint8_t on)
 {
-  if (len > RS485_RX_BUF_SIZE)
+#if (LED_ACTIVE_HIGH != 0U)
+  HAL_GPIO_WritePin(port, pin, (on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+#else
+  HAL_GPIO_WritePin(port, pin, (on != 0U) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+#endif
+}
+
+/**
+  * @brief 把传感器状态刷进输入寄存器（3x 区），主站用功能码 04 读
+  */
+static void app_update_inputs(void)
+{
+  int32_t mdeg = DS18B20_GetMilliDeg();
+  int32_t t100;
+
+  /* 毫摄氏度 -> 0.01 ℃，四舍五入；有符号整数除法向 0 截断，负数单独处理 */
+  if (mdeg >= 0)
   {
-    return;
+    t100 = (mdeg + 5) / 10;
+  }
+  else
+  {
+    t100 = (mdeg - 5) / 10;
   }
 
-  if (g_frame_len != 0U)      /* 上一帧还没被主循环取走，直接丢弃，避免撕裂 */
+  MODBUS_SetInputReg(MB_IR_TEMP_X100, (uint16_t)(int16_t)t100);
+  MODBUS_SetInputReg(MB_IR_PRESENT,   (uint16_t)DS18B20_IsPresent());
+  MODBUS_SetInputReg(MB_IR_OK_CNT,    (uint16_t)(DS18B20_GetOkCount() & 0xFFFFU));
+  MODBUS_SetInputReg(MB_IR_ERR_CNT,   (uint16_t)(DS18B20_GetErrCount() & 0xFFFFU));
+  MODBUS_SetInputReg(MB_IR_LAST_ERR,  (uint16_t)DS18B20_GetLastError());
+  MODBUS_SetInputReg(MB_IR_UPTIME_S,  (uint16_t)((HAL_GetTick() / 1000U) & 0xFFFFU));
+}
+
+/**
+  * @brief 按保持寄存器里的模式/周期驱动 LED，并把实际状态回写到线圈
+  * @note  模式 0 = 手动，线圈直接控制；1 = 同步闪烁；2 = 流水灯
+  */
+static void app_led_pattern(void)
+{
+  uint16_t period = MODBUS_GetHoldingReg(MB_HR_BLINK_MS);
+  uint16_t mode   = MODBUS_GetHoldingReg(MB_HR_MODE);
+  uint32_t now    = HAL_GetTick();
+  uint8_t  r;
+  uint8_t  g;
+  uint8_t  b;
+
+  if (period < 50U)                 /* 周期太短视觉上就是常亮，也没有意义 */
   {
-    return;
+    period = 50U;
   }
 
-  memcpy(g_frame, data, len);
-  g_frame_len = len;
-  HAL_GPIO_TogglePin(LEDB_GPIO_Port, LEDB_Pin);
+  if (mode == MB_MODE_BLINK)
+  {
+    if ((now - g_led_tick) >= period)
+    {
+      g_led_tick = now;
+      g_led_step ^= 1U;
+    }
+    r = g_led_step;
+    g = g_led_step;
+    b = g_led_step;
+  }
+  else if (mode == MB_MODE_FLOW)
+  {
+    if ((now - g_led_tick) >= period)
+    {
+      g_led_tick = now;
+      g_led_step = (uint8_t)((g_led_step + 1U) % 3U);
+    }
+    r = (g_led_step == 0U) ? 1U : 0U;
+    g = (g_led_step == 1U) ? 1U : 0U;
+    b = (g_led_step == 2U) ? 1U : 0U;
+  }
+  else                              /* MB_MODE_MANUAL */
+  {
+    r = MODBUS_GetCoil(MB_COIL_LEDR);
+    g = MODBUS_GetCoil(MB_COIL_LEDG);
+    b = MODBUS_GetCoil(MB_COIL_LEDB);
+  }
+
+  app_led_write(LEDR_GPIO_Port, LEDR_Pin, r);
+  app_led_write(LEDG_GPIO_Port, LEDG_Pin, g);
+  app_led_write(LEDB_GPIO_Port, LEDB_Pin, b);
+
+  /* 自动模式下把实际状态回写，主站读线圈/离散输入时看到的是真实状态 */
+  MODBUS_SetCoil(MB_COIL_LEDR, r);
+  MODBUS_SetCoil(MB_COIL_LEDG, g);
+  MODBUS_SetCoil(MB_COIL_LEDB, b);
+
+  MODBUS_SetDiscreteInput(MB_DI_LEDR, r);
+  MODBUS_SetDiscreteInput(MB_DI_LEDG, g);
+  MODBUS_SetDiscreteInput(MB_DI_LEDB, b);
 }
 /* USER CODE END 0 */
 
@@ -120,7 +194,12 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  RS485_Init(RS485_OnFrame);
+  /* Modbus 先初始化，保证第一帧到来时数据区已经就绪 */
+  MODBUS_Init();
+  /* 把 MODBUS_OnFrame 作为收帧回调交给 RS485 驱动（中断里只拼字节） */
+  RS485_Init(MODBUS_OnFrame);
+  /* DS18B20 初始化：返回 0 说明 PE3 上没探测到器件（断线 / 没接上拉） */
+  (void)DS18B20_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -131,27 +210,18 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    /* 1) 回显：收到什么就原样发回 USB 侧，用来验证发送链路
-          发送成功后才清标志，失败（忙）则下一轮重试 */
-    if ((g_frame_len > 0U) && (RS485_IsBusy() == 0U))
-    {
-      if (RS485_Send(g_frame, g_frame_len) == HAL_OK)
-      {
-        g_frame_len = 0U;
-      }
-    }
+    /* 1) 传感器：非阻塞状态机，1 秒一轮、每轮等 750 ms 转换 */
+    DS18B20_Task();
 
-    /* 2) 主动上报：每 2 秒往 USB 侧发一行，验证 printf 格式化发送
-          不需要的话把这一段整块删掉 */
-    if ((HAL_GetTick() - g_tick_last) >= 2000U)
-    {
-      g_tick_last = HAL_GetTick();
-      (void)RS485_Printf("01LED alive, cnt=%lu, tick=%lu ms\r\n",
-                         (unsigned long)g_report_cnt++,
-                         (unsigned long)g_tick_last);
-    }
+    /* 2) 把最新温度/计数刷进输入寄存器（3x 区），主站用 04 读 */
+    app_update_inputs();
 
-    /* USER CODE END 3 */
+    /* 3) 按保持寄存器里的模式驱动 LED，并回写线圈状态 */
+    app_led_pattern();
+
+    /* 4) Modbus 从机：攒够一帧就解析并应答（发送在这里做，不在中断里做） */
+    MODBUS_Task();
+
   }
   /* USER CODE END 3 */
 }

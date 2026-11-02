@@ -46,6 +46,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # HardLib：手写硬件驱动层，CubeMX 重新生成不会动这里
     ${CMAKE_CURRENT_SOURCE_DIR}/HardLib/rs485.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/HardLib/ds18b20.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/HardLib/modbus.c
 )
 
 # Add include paths

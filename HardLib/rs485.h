@@ -57,6 +57,12 @@ HAL_StatusTypeDef RS485_Send(const uint8_t *data, uint16_t len);
 uint8_t RS485_IsBusy(void);
 
 /**
+  * @brief DMA / UART 是否还有未交付给收帧回调的接收字节
+  * @note  Modbus 判定帧结束前使用；挂着空闲的 DMA 接收不算正在收数据。
+  */
+uint8_t RS485_IsRxActive(void);
+
+/**
   * @brief 发送一个字符串（自动计算长度，不含结尾 '\0'）
   */
 HAL_StatusTypeDef RS485_SendString(const char *str);
